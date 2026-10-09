@@ -1,16 +1,14 @@
-# Python cache
+.env
 __pycache__/
 *.py[cod]
-
-# Virtual environments
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
 .venv/
 venv/
 env/
-
-# Environment variables
-.env
-
-# OS/editor files
-.DS_Store
-Thumbs.db
 .vscode/
+.idea/
+*.log

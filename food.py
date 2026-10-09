@@ -2,6 +2,7 @@ import os
 import re
 import io
 import logging
+from urllib.parse import quote
 
 import discord
 from discord import app_commands
@@ -44,17 +45,54 @@ def get_reiwa_year_and_month(target_date):
 
 
 def build_pdf_url(target_date):
-    """対象日の献立 PDF URL を生成"""
+    """対象日の献立 PDF URL（優先候補）を生成"""
+    return build_pdf_url_candidates(target_date)[0]
+
+
+def build_pdf_url_candidates(target_date):
+    """対象日の献立 PDF URL 候補を優先順で返す"""
     reiwa_year, month = get_reiwa_year_and_month(target_date)
-    return (
-        "https://www.kushiro-ct.ac.jp/wordpress/wp-content/uploads/"
-        f"2015/11/R{reiwa_year}.{month}_ryokondate.pdf"
-    )
+    base_url = "https://www.kushiro-ct.ac.jp/wordpress/wp-content/uploads/2015/11/"
+
+    # ベースファイル名パターン（拡張子なし）
+    base_patterns = [
+        f"寮務提出用R{reiwa_year}年度{month}月__献立表-",
+        f"寮務提出用R{reiwa_year}年度__献立表-",
+        f"寮務提出用R{reiwa_year}年{month}月度__献立表-",
+        f"寮務提出用R{reiwa_year}年{month}月度_献立表-",
+    ]
+
+    # 改訂版サフィックス（新しい改訂版を優先: -10, -9, ..., -2, なし）
+    revision_suffixes = [str(i) for i in range(10, 1, -1)] + [""]
+
+    filenames = []
+    # 改訂版を優先的に試行（最新の改訂番号から）
+    for suffix in revision_suffixes:
+        for pattern in base_patterns:
+            if suffix:
+                filenames.append(f"{pattern}{suffix}.pdf")
+            else:
+                filenames.append(f"{pattern}.pdf")
+
+    # サフィックスなしのパターン
+    filenames.extend([
+        f"寮務提出用R{reiwa_year}年{month}月度献立表.pdf",
+        f"R{reiwa_year}.{month}_ryokondate.pdf",
+        f"kondate{month}gatu.pdf",
+    ])
+
+    urls = []
+    for name in filenames:
+        if re.search(r"[^\x00-\x7F]", name):
+            urls.append(base_url + quote(name))
+        else:
+            urls.append(base_url + name)
+    return urls
 
 
 def download_pdf(url):
     """PDF をダウンロードして BytesIO で返す"""
-    resp = requests.get(url, timeout=30)
+    resp = requests.get(url, timeout=15)
     resp.raise_for_status()
     return io.BytesIO(resp.content)
 
@@ -63,8 +101,8 @@ def download_pdf(url):
 #  PDF パース
 # ============================
 
-def extract_menu_for_day(pdf_bytes, day):
-    """PDF から指定日 (日にち) の三食メニューを抽出して返す。
+def extract_menu_for_day(pdf_bytes, month, day):
+    """PDF から指定日 (月・日) の三食メニューを抽出して返す。
     戻り値: dict{"朝食": ..., "昼食": ..., "夕食": ...} or None
     """
     with pdfplumber.open(pdf_bytes) as pdf:
@@ -72,30 +110,30 @@ def extract_menu_for_day(pdf_bytes, day):
         for page in pdf.pages:
             tables = page.extract_tables()
             for table in tables:
-                result = _parse_table(table, day)
+                result = _parse_table(table, month, day)
                 if result is not None:
                     # 日付列が見つかった（データ有無問わず）→ テキスト解析に落とさない
-                    return result or None
+                    return result
 
         # 2) テーブルに日付列が無い場合のみテキストベースで試行
         for page in pdf.pages:
             text = page.extract_text()
             if text:
-                result = _parse_text(text, day)
-                if result:
+                result = _parse_text(text, month, day)
+                if result is not None:
                     return result
 
     return None
 
 
-def _find_date_column(header_row, day):
+def _find_date_column(header_row, month, day):
     """ヘッダー行から対象日の列インデックスを返す"""
     for j, cell in enumerate(header_row):
         if not cell:
             continue
-        # 「3月6日」のようなパターンから日を抽出
-        m = re.search(r"(\d{1,2})月(\d{1,2})日", str(cell))
-        if m and int(m.group(2)) == day:
+        # 「3月6日」や「3/6」のようなパターンから抽出。空白や改行も許容
+        m = re.search(r"(\d{1,2})\s*(?:月|/)\s*(\d{1,2})\s*日?", str(cell))
+        if m and int(m.group(1)) == month and int(m.group(2)) == day:
             return j
     return None
 
@@ -195,10 +233,10 @@ def _is_nutrition_row(row, col_idx):
     return False
 
 
-def _parse_text(text, day):
+def _parse_text(text, month, day):
     """テキストから指定日のメニューをフォールバック抽出"""
-    # 対象日を含む行を探す
-    day_pattern = re.compile(rf"(\d{{1,2}})月\s*{day}日")
+    # 対象日を含む行を探す。空白や「/」区切りも考慮
+    day_pattern = re.compile(rf"{month}\s*(?:月|/)\s*{day}\s*日?")
     if not day_pattern.search(text):
         return None
 
@@ -231,17 +269,17 @@ def _parse_text(text, day):
         if cleaned:
             menu[meal_name] = cleaned
 
-    return menu if menu else None
+    return menu
 
 
-def _parse_table(table, day):
+def _parse_table(table, month, day):
     """テーブルから指定日のメニューを検索
     PDF は日付が列、食事が行のレイアウト"""
     if not table or len(table) < 2:
         return None
 
     # ヘッダー行（Row 0）から対象日の列を特定
-    col_idx = _find_date_column(table[0], day)
+    col_idx = _find_date_column(table[0], month, day)
     if col_idx is None:
         return None
 
@@ -312,13 +350,82 @@ def _parse_table(table, day):
 #  メニュー取得 & フォーマット
 # ============================
 
+# 月ごとに発見済みURLをキャッシュ {(year, month): url}
+_pdf_url_cache: dict[tuple[int, int], str] = {}
+
+
+def _find_valid_pdf_url(target_date):
+    """HEADリクエストで存在するPDF URLを高速に探索する。
+    同月内はキャッシュされたURLを優先的に返す。
+    """
+    cache_key = (target_date.year, target_date.month)
+
+    # キャッシュがあればまず試す
+    if cache_key in _pdf_url_cache:
+        cached_url = _pdf_url_cache[cache_key]
+        try:
+            resp = requests.head(cached_url, timeout=5, allow_redirects=True)
+            if resp.status_code == 200:
+                logger.info("キャッシュ済みURL使用: %s", cached_url)
+                return cached_url
+        except requests.RequestException:
+            pass
+        del _pdf_url_cache[cache_key]
+
+    # 候補を順番にHEADで確認（GETより大幅に高速）
+    for url in build_pdf_url_candidates(target_date):
+        try:
+            resp = requests.head(url, timeout=5, allow_redirects=True)
+            if resp.status_code == 200:
+                logger.info("PDF URL 発見: %s", url)
+                _pdf_url_cache[cache_key] = url
+                return url
+        except requests.RequestException:
+            continue
+
+    return None
+
+
 def get_menu_for_date(target_date):
     """指定日のメニューを (menu_dict, url) で返す"""
-    url = build_pdf_url(target_date)
-    logger.info("PDF URL: %s", url)
-    pdf_bytes = download_pdf(url)
-    menu = extract_menu_for_day(pdf_bytes, target_date.day)
-    return menu, url
+    # まず有効なURLを高速に特定
+    valid_url = _find_valid_pdf_url(target_date)
+
+    if valid_url:
+        # 有効なURLが見つかったら直接GETでダウンロード
+        try:
+            pdf_bytes = download_pdf(valid_url)
+            menu = extract_menu_for_day(pdf_bytes, target_date.month, target_date.day)
+            if menu is not None:
+                return menu, valid_url
+        except requests.HTTPError:
+            pass
+
+    # フォールバック: 全候補を順番にGETで試行（HEADが使えないサーバーへの対応）
+    last_error = None
+    for url in build_pdf_url_candidates(target_date):
+        if url == valid_url:
+            continue  # 既に試したURLはスキップ
+        logger.info("PDF URL を試行 (フォールバック): %s", url)
+        try:
+            pdf_bytes = download_pdf(url)
+            menu = extract_menu_for_day(pdf_bytes, target_date.month, target_date.day)
+            if menu is not None:
+                _pdf_url_cache[(target_date.year, target_date.month)] = url
+                return menu, url
+            else:
+                last_error = requests.HTTPError("PDF内に指定日のデータが見つかりません。")
+                continue
+        except requests.HTTPError as e:
+            status_code = e.response.status_code if e.response is not None else None
+            if status_code == 404:
+                last_error = e
+                continue
+            raise
+
+    if last_error:
+        raise last_error
+    raise requests.HTTPError("献立 PDF の取得に失敗しました。")
 
 
 def format_menu_embed(target_date, menu, url):

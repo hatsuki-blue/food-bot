@@ -1,0 +1,16 @@
+[Unit]
+Description=Discord Food Menu Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hatsuki
+WorkingDirectory=/home/hatsuki/bot/food-bot
+ExecStart=/home/hatsuki/bot/food-bot/venv/bin/python /home/hatsuki/bot/food-bot/food.py
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target
