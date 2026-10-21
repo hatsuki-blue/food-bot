@@ -1,7 +1,11 @@
 import os
 import re
 import io
+import asyncio
+import calendar
 import logging
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote
 
 import discord
@@ -101,31 +105,6 @@ def download_pdf(url):
 #  PDF パース
 # ============================
 
-def extract_menu_for_day(pdf_bytes, month, day):
-    """PDF から指定日 (月・日) の三食メニューを抽出して返す。
-    戻り値: dict{"朝食": ..., "昼食": ..., "夕食": ...} or None
-    """
-    with pdfplumber.open(pdf_bytes) as pdf:
-        # 1) テーブル抽出を試行
-        for page in pdf.pages:
-            tables = page.extract_tables()
-            for table in tables:
-                result = _parse_table(table, month, day)
-                if result is not None:
-                    # 日付列が見つかった（データ有無問わず）→ テキスト解析に落とさない
-                    return result
-
-        # 2) テーブルに日付列が無い場合のみテキストベースで試行
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                result = _parse_text(text, month, day)
-                if result is not None:
-                    return result
-
-    return None
-
-
 def _find_date_column(header_row, month, day):
     """ヘッダー行から対象日の列インデックスを返す"""
     for j, cell in enumerate(header_row):
@@ -175,6 +154,18 @@ def _clean_menu_text(text):
     return "\n".join(cleaned)
 
 
+def _join_wrapped_lines(items):
+    """PDF セル内の折り返しで途中切れした行を結合する。
+    1 行が折り返し幅 (全角約 11 文字) 以上なら、次の行は続きとみなす。"""
+    joined = []
+    for item in items:
+        if joined and len(joined[-1]) >= 11 and not joined[-1].endswith(("】", "）", ")")):
+            joined[-1] += item
+        else:
+            joined.append(item)
+    return joined
+
+
 def _parse_dinner_ab(text):
     """夕食のテキストを A食・B食・共通 に分類して返す
     戻り値: dict{"A": str or None, "B": str or None, "共通": str or None}
@@ -186,7 +177,10 @@ def _parse_dinner_ab(text):
     a_items = []
     b_items = []
     common_items = []
-    current = common_items  # デフォルトは共通
+    pre_items = []  # 最初のラベルより前の行（誕生日会などラベル無しの A 食用）
+    current = pre_items
+    seen_a = False
+    seen_b = False
 
     for line in lines:
         line = line.strip()
@@ -199,24 +193,38 @@ def _parse_dinner_ab(text):
         # 単独の "A" → A食セクション開始
         if re.match(r"^A$", line):
             current = a_items
+            seen_a = True
             continue
         # 単独の "B" → B食セクション開始
         if re.match(r"^B$", line):
             current = b_items
+            seen_b = True
             continue
         # "A メニュー名" プレフィックス付き
         m = re.match(r"^A\s+(.+)", line)
         if m:
             a_items.append(m.group(1))
             current = a_items
+            seen_a = True
             continue
         # "B メニュー名" プレフィックス付き
         m = re.match(r"^B\s+(.+)", line)
         if m:
             b_items.append(m.group(1))
             current = b_items
+            seen_b = True
             continue
         current.append(line)
+
+    # ラベル無しで始まり B だけ後に出てくる場合は、その行群が A 食
+    if pre_items:
+        if seen_b and not seen_a:
+            a_items = pre_items + a_items
+        else:
+            common_items = pre_items + common_items
+
+    a_items = _join_wrapped_lines(a_items)
+    b_items = _join_wrapped_lines(b_items)
 
     return {
         "A": "\n".join(a_items) if a_items else None,
@@ -236,7 +244,8 @@ def _is_nutrition_row(row, col_idx):
 def _parse_text(text, month, day):
     """テキストから指定日のメニューをフォールバック抽出"""
     # 対象日を含む行を探す。空白や「/」区切りも考慮
-    day_pattern = re.compile(rf"{month}\s*(?:月|/)\s*{day}\s*日?")
+    # 前後に数字が続く場合は除外（「4月1」が「4月10日」にマッチしないように）
+    day_pattern = re.compile(rf"(?<!\d){month}\s*(?:月|/)\s*{day}(?!\d)\s*日?")
     if not day_pattern.search(text):
         return None
 
@@ -350,82 +359,190 @@ def _parse_table(table, month, day):
 #  メニュー取得 & フォーマット
 # ============================
 
-# 月ごとに発見済みURLをキャッシュ {(year, month): url}
-_pdf_url_cache: dict[tuple[int, int], str] = {}
+# 解析済みメニューのキャッシュ {(url, year, month): {date: menu_dict}}
+# 改訂版は別 URL (-2, -3, ...) で公開されるため、URL が同じなら中身も同じとみなす
+_month_menu_cache: dict[tuple[str, int, int], dict] = {}
+
+# 存在確認済み URL のキャッシュ {(year, month): (確認時刻, [url, ...])}
+_existing_url_cache: dict[tuple[int, int], tuple[datetime, list[str]]] = {}
+_EXISTING_URL_TTL = timedelta(minutes=10)
 
 
-def _find_valid_pdf_url(target_date):
-    """HEADリクエストで存在するPDF URLを高速に探索する。
-    同月内はキャッシュされたURLを優先的に返す。
-    """
+def _url_exists(url):
+    """HEAD リクエストで URL が存在するか確認"""
+    try:
+        resp = requests.head(url, timeout=5, allow_redirects=True)
+        return resp.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def _find_existing_pdf_urls(target_date):
+    """全候補に並列で HEAD を送り、存在する PDF URL を優先順で返す。
+    改訂版の公開を拾えるよう、結果は一定時間だけキャッシュする。"""
     cache_key = (target_date.year, target_date.month)
+    cached = _existing_url_cache.get(cache_key)
+    if cached and datetime.now(JST) - cached[0] < _EXISTING_URL_TTL:
+        return cached[1]
 
-    # キャッシュがあればまず試す
-    if cache_key in _pdf_url_cache:
-        cached_url = _pdf_url_cache[cache_key]
-        try:
-            resp = requests.head(cached_url, timeout=5, allow_redirects=True)
-            if resp.status_code == 200:
-                logger.info("キャッシュ済みURL使用: %s", cached_url)
-                return cached_url
-        except requests.RequestException:
-            pass
-        del _pdf_url_cache[cache_key]
+    candidates = build_pdf_url_candidates(target_date)
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        exists = list(executor.map(_url_exists, candidates))
+    urls = [url for url, ok in zip(candidates, exists) if ok]
+    if urls:
+        _existing_url_cache[cache_key] = (datetime.now(JST), urls)
+    return urls
 
-    # 候補を順番にHEADで確認（GETより大幅に高速）
-    for url in build_pdf_url_candidates(target_date):
+
+def extract_menus_for_month(pdf_bytes, year, month):
+    """PDF から指定月の全日分のメニューを {date: menu_dict} で返す。
+    PDF は 1 回だけ開き、全ページのテキスト抽出はテーブルで見つからない日がある場合のみ行う。"""
+    from datetime import date
+    menus = {}
+    with pdfplumber.open(pdf_bytes) as pdf:
+        # 別の月の PDF なら重いテーブル解析をせずに終了（1 ページ目に日付が並ぶ）
+        first_text = pdf.pages[0].extract_text() or "" if pdf.pages else ""
+        if not re.search(rf"(?<!\d){month}\s*(?:月|/)\s*\d", first_text):
+            return menus
+
+        tables = [t for page in pdf.pages for t in page.extract_tables()]
+        texts = None
+        for day in range(1, calendar.monthrange(year, month)[1] + 1):
+            menu = None
+            for table in tables:
+                menu = _parse_table(table, month, day)
+                if menu is not None:
+                    break
+            if menu is None:
+                if texts is None:
+                    texts = [page.extract_text() or "" for page in pdf.pages]
+                for text in texts:
+                    menu = _parse_text(text, month, day)
+                    if menu is not None:
+                        break
+            if menu:
+                menus[date(year, month, day)] = menu
+    return menus
+
+
+def _get_menus_from_url(url, year, month):
+    """URL の PDF から指定月のメニューを取得（キャッシュ付き）"""
+    key = (url, year, month)
+    if key not in _month_menu_cache:
+        pdf_bytes = download_pdf(url)
+        _month_menu_cache[key] = extract_menus_for_month(pdf_bytes, year, month)
+        logger.info("PDF を解析しました: %s (%d 日分)", url, len(_month_menu_cache[key]))
+    return _month_menu_cache[key]
+
+
+def get_menus_for_month(year, month):
+    """指定月の全メニューを ({date: menu_dict}, url) で返す"""
+    from datetime import date
+    first_day = date(year, month, 1)
+
+    # HEAD が使えないサーバーへの対応として、見つからなければ全候補を GET で試す
+    urls = _find_existing_pdf_urls(first_day) or build_pdf_url_candidates(first_day)
+
+    for url in urls:
         try:
-            resp = requests.head(url, timeout=5, allow_redirects=True)
-            if resp.status_code == 200:
-                logger.info("PDF URL 発見: %s", url)
-                _pdf_url_cache[cache_key] = url
-                return url
-        except requests.RequestException:
+            menus = _get_menus_from_url(url, year, month)
+        except requests.HTTPError:
             continue
+        if menus:
+            return menus, url
 
-    return None
+    raise requests.HTTPError(f"{year}年{month}月の献立 PDF が見つかりません。")
 
 
 def get_menu_for_date(target_date):
-    """指定日のメニューを (menu_dict, url) で返す"""
-    # まず有効なURLを高速に特定
-    valid_url = _find_valid_pdf_url(target_date)
+    """指定日のメニューを (menu_dict, url) で返す。
+    PDF に載っていない日は空の dict を返す。"""
+    menus, url = get_menus_for_month(target_date.year, target_date.month)
+    return menus.get(target_date, {}), url
 
-    if valid_url:
-        # 有効なURLが見つかったら直接GETでダウンロード
-        try:
-            pdf_bytes = download_pdf(valid_url)
-            menu = extract_menu_for_day(pdf_bytes, target_date.month, target_date.day)
-            if menu is not None:
-                return menu, valid_url
-        except requests.HTTPError:
-            pass
 
-    # フォールバック: 全候補を順番にGETで試行（HEADが使えないサーバーへの対応）
-    last_error = None
-    for url in build_pdf_url_candidates(target_date):
-        if url == valid_url:
-            continue  # 既に試したURLはスキップ
-        logger.info("PDF URL を試行 (フォールバック): %s", url)
-        try:
-            pdf_bytes = download_pdf(url)
-            menu = extract_menu_for_day(pdf_bytes, target_date.month, target_date.day)
-            if menu is not None:
-                _pdf_url_cache[(target_date.year, target_date.month)] = url
-                return menu, url
-            else:
-                last_error = requests.HTTPError("PDF内に指定日のデータが見つかりません。")
-                continue
-        except requests.HTTPError as e:
-            status_code = e.response.status_code if e.response is not None else None
-            if status_code == 404:
-                last_error = e
-                continue
-            raise
+def _normalize_for_search(text):
+    """検索用に表記ゆれを吸収する（全角半角・大小文字・ひらがな→カタカナ）"""
+    text = unicodedata.normalize("NFKC", text).lower()
+    return "".join(
+        chr(ord(c) + 0x60) if "ぁ" <= c <= "ゖ" else c
+        for c in text
+    )
 
-    if last_error:
-        raise last_error
-    raise requests.HTTPError("献立 PDF の取得に失敗しました。")
+
+def _iter_menu_lines(menu):
+    """メニュー dict から (食事ラベル, 料理名) を順に返す"""
+    for meal in ["朝食", "昼食", "夕食"]:
+        value = menu.get(meal)
+        if not value:
+            continue
+        if isinstance(value, dict):
+            # 夕食の A食/B食/共通
+            for key in ["A", "B", "共通"]:
+                if value.get(key):
+                    label = f"{meal}({key})" if key != "共通" else meal
+                    for line in value[key].split("\n"):
+                        yield label, line
+        else:
+            for line in value.split("\n"):
+                yield meal, line
+
+
+def search_menus(menus, keyword):
+    """キーワードを含む料理を [(date, 食事ラベル, 料理名), ...] で返す"""
+    needle = _normalize_for_search(keyword)
+    hits = []
+    for d in sorted(menus):
+        for label, line in _iter_menu_lines(menus[d]):
+            if needle in _normalize_for_search(line):
+                hits.append((d, label, line))
+    return hits
+
+
+def format_search_embeds(keyword, year, month, hits, url):
+    """検索結果を Discord Embed のリストに整形。
+    Embed の上限 (フィールド 25 個・合計 6000 文字) を超える分は次の Embed に送る。"""
+    weekday_names = ["月", "火", "水", "木", "金", "土", "日"]
+    emoji_map = {"朝食": "🌅", "昼食": "☀️", "夕食": "🌙"}
+    title = f"🔍 「{keyword}」の検索結果（{year}年{month}月）"
+
+    if not hits:
+        embed = discord.Embed(title=title, color=0x00BFFF, url=url)
+        embed.description = "該当するメニューはありませんでした。"
+        return [embed]
+
+    # 日付ごとにまとめる
+    by_date = {}
+    for d, label, line in hits:
+        by_date.setdefault(d, []).append(f"{emoji_map.get(label[:2], '🍴')} {label}: {line}")
+
+    # (フィールド名, 値) の一覧を作る。値が 1024 文字を超える日は複数フィールドに分割
+    today = datetime.now(JST).date()
+    fields = []
+    for d in sorted(by_date):
+        wd = weekday_names[d.weekday()]
+        mark = "（今日）" if d == today else ""
+        name = f"{d.month}/{d.day}（{wd}）{mark}"
+        chunk = []
+        for line in by_date[d]:
+            if chunk and len("\n".join(chunk + [line])) > 1024:
+                fields.append((name, "\n".join(chunk)))
+                name = f"{d.month}/{d.day}（続き）"
+                chunk = []
+            chunk.append(line[:1024])
+        fields.append((name, "\n".join(chunk)))
+
+    embed = discord.Embed(
+        title=title, color=0x00BFFF, url=url,
+        description=f"{len(by_date)} 日分ヒットしました。",
+    )
+    embeds = [embed]
+    for name, value in fields:
+        if len(embed.fields) >= 25 or len(embed) + len(name) + len(value) > 5800:
+            embed = discord.Embed(title=f"{title}（続き）", color=0x00BFFF, url=url)
+            embeds.append(embed)
+        embed.add_field(name=name, value=value, inline=False)
+    return embeds
 
 
 def format_menu_embed(target_date, menu, url):
@@ -458,8 +575,12 @@ def format_menu_embed(target_date, menu, url):
             a_text = ab.get("A")
             b_text = ab.get("B")
             common_text = ab.get("共通")
-            parts.append(f"**【A食】**\n{a_text if a_text else 'なし'}")
-            parts.append(f"**【B食】**\n{b_text if b_text else 'なし'}")
+            if a_text and b_text:
+                parts.append(f"**【A食】**\n{a_text}")
+                parts.append(f"**【B食】**\n{b_text}")
+            elif a_text or b_text:
+                # A/B の選択が無い日（カレー等）は「メイン」として表示
+                parts.append(f"**【メイン】**\n{a_text or b_text}")
             if common_text:
                 parts.append(f"**【共通】**\n{common_text}")
             value = "\n".join(parts)
@@ -488,6 +609,18 @@ async def on_ready():
     logger.info("%s としてログインしました（スラッシュコマンド同期完了）", client.user)
     if not daily_menu_notify.is_running():
         daily_menu_notify.start()
+    asyncio.create_task(warm_menu_cache())
+
+
+async def warm_menu_cache():
+    """今月・来月の献立を先読みしてキャッシュしておく（初回コマンドの高速化）"""
+    today = datetime.now(JST).date()
+    next_month = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
+    for d in (today, next_month):
+        try:
+            await asyncio.to_thread(get_menus_for_month, d.year, d.month)
+        except Exception as e:
+            logger.info("%d年%d月の献立の先読みをスキップ: %s", d.year, d.month, e)
 
 
 @tasks.loop(time=dtime(hour=22, minute=0, tzinfo=JST))
@@ -500,7 +633,7 @@ async def daily_menu_notify():
 
     tomorrow = datetime.now(JST).date() + timedelta(days=1)
     try:
-        menu, url = get_menu_for_date(tomorrow)
+        menu, url = await asyncio.to_thread(get_menu_for_date, tomorrow)
         embed = format_menu_embed(tomorrow, menu, url)
         await channel.send(embed=embed)
         logger.info("翌日 (%s) の献立を送信しました", tomorrow)
@@ -557,7 +690,7 @@ async def cmd_menu(interaction: discord.Interaction, date_str: str = None):
 
     await interaction.response.defer()
     try:
-        menu, url = get_menu_for_date(target)
+        menu, url = await asyncio.to_thread(get_menu_for_date, target)
         embed = format_menu_embed(target, menu, url)
         await interaction.followup.send(embed=embed)
     except requests.HTTPError:
@@ -572,13 +705,43 @@ async def cmd_tomorrow(interaction: discord.Interaction):
     await interaction.response.defer()
     tomorrow = datetime.now(JST).date() + timedelta(days=1)
     try:
-        menu, url = get_menu_for_date(tomorrow)
+        menu, url = await asyncio.to_thread(get_menu_for_date, tomorrow)
         embed = format_menu_embed(tomorrow, menu, url)
         await interaction.followup.send(embed=embed)
     except requests.HTTPError:
         await interaction.followup.send(f"⚠️ 献立 PDF が見つかりません。\nURL: {build_pdf_url(tomorrow)}")
     except Exception as e:
         logger.exception("/tomorrow コマンドでエラー")
+        await interaction.followup.send(f"⚠️ エラーが発生しました: {e}")
+
+
+@tree.command(name="search", description="キーワードで献立を検索（例: カレー）")
+@app_commands.describe(
+    keyword="検索する料理名の一部 (例: カレー, 唐揚げ)",
+    month="検索する月 (1〜12)。省略すると今月。",
+)
+async def cmd_search(
+    interaction: discord.Interaction,
+    keyword: str,
+    month: app_commands.Range[int, 1, 12] = None,
+):
+    today = datetime.now(JST).date()
+    year = today.year
+    if month is None:
+        month = today.month
+
+    await interaction.response.defer()
+    try:
+        # 月全体の PDF 解析は時間がかかるため別スレッドで実行
+        menus, url = await asyncio.to_thread(get_menus_for_month, year, month)
+        hits = search_menus(menus, keyword)
+        # 1 メッセージの Embed 合計は 6000 文字までなので 1 件ずつ送る
+        for embed in format_search_embeds(keyword, year, month, hits, url):
+            await interaction.followup.send(embed=embed)
+    except requests.HTTPError:
+        await interaction.followup.send(f"⚠️ {year}年{month}月の献立 PDF が見つかりません。")
+    except Exception as e:
+        logger.exception("/search コマンドでエラー")
         await interaction.followup.send(f"⚠️ エラーが発生しました: {e}")
 
 
