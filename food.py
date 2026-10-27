@@ -1,6 +1,7 @@
 import os
 import re
 import io
+import html
 import asyncio
 import calendar
 import logging
@@ -24,6 +25,11 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 
 # 日本標準時 (UTC+9)
 JST = timezone(timedelta(hours=9))
+
+# 献立 PDF の掲載ページ（学生寮の記事）と WordPress REST API
+MENU_PAGE_URL = "https://www.kushiro-ct.ac.jp/2015/11/10/3512/"
+MENU_POST_ID = 3512
+WP_API_BASE = "https://www.kushiro-ct.ac.jp/wp-json/wp/v2"
 
 # ログ設定
 logging.basicConfig(
@@ -56,12 +62,14 @@ def build_pdf_url(target_date):
 def build_pdf_url_candidates(target_date):
     """対象日の献立 PDF URL 候補を優先順で返す"""
     reiwa_year, month = get_reiwa_year_and_month(target_date)
+    # 「R8年度」は年度表記なので 1〜3 月は前年の令和年になる
+    fiscal_reiwa_year = reiwa_year - 1 if month <= 3 else reiwa_year
     base_url = "https://www.kushiro-ct.ac.jp/wordpress/wp-content/uploads/2015/11/"
 
     # ベースファイル名パターン（拡張子なし）
     base_patterns = [
-        f"寮務提出用R{reiwa_year}年度{month}月__献立表-",
-        f"寮務提出用R{reiwa_year}年度__献立表-",
+        f"寮務提出用R{fiscal_reiwa_year}年度{month}月__献立表-",
+        f"寮務提出用R{fiscal_reiwa_year}年度__献立表-",
         f"寮務提出用R{reiwa_year}年{month}月度__献立表-",
         f"寮務提出用R{reiwa_year}年{month}月度_献立表-",
     ]
@@ -83,6 +91,8 @@ def build_pdf_url_candidates(target_date):
         f"寮務提出用R{reiwa_year}年{month}月度献立表.pdf",
         f"R{reiwa_year}.{month}_ryokondate.pdf",
         f"kondate{month}gatu.pdf",
+        f"konndate{month}gatu.pdf",
+        f"kondate_{target_date.year}{month:02d}.pdf",
     ])
 
     urls = []
@@ -92,6 +102,130 @@ def build_pdf_url_candidates(target_date):
         else:
             urls.append(base_url + name)
     return urls
+
+
+def parse_menu_page_links(page_html):
+    """掲載ページの HTML から {(year, month): pdf_url} を返す。
+    「令和N年度」の見出しの後に「M月のメニュー」のリンクが並ぶ構造を前提にする。
+    同じ月が複数ある場合はページ上で先に出てくる（新しい）方を採用する。"""
+    # 献立セクションより前にある「令和N年度」（寮のしおり等）を拾わないよう切り出す
+    start = page_html.find("学生寮食堂の献立")
+    if start >= 0:
+        page_html = page_html[start:]
+
+    token = re.compile(
+        r"令和\s*(\d+|元)\s*年度"
+        r"|<a\s[^>]*href=\"([^\"]+?\.pdf)\"[^>]*>(.*?)</a>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    links = {}
+    fiscal_year = None  # 令和の年度
+    for m in token.finditer(page_html):
+        if m.group(1):
+            fiscal_year = 1 if m.group(1) == "元" else int(m.group(1))
+            continue
+        if fiscal_year is None:
+            continue
+        # リンク文言は「11月のメニュー」「３月のメニュー」など（\d は全角数字にもマッチ）
+        text = re.sub(r"<[^>]+>", "", m.group(3))
+        mm = re.search(r"(\d{1,2})\s*月", text)
+        if not mm or "メニュー" not in text:
+            continue
+        month = int(mm.group(1))
+        if not 1 <= month <= 12:
+            continue
+        year = 2018 + fiscal_year + (1 if month <= 3 else 0)
+        url = requests.utils.requote_uri(html.unescape(m.group(2)))
+        links.setdefault((year, month), url)
+    return links
+
+
+# 掲載ページ / REST API の取得結果キャッシュ {キー: (取得時刻, 値)}
+_remote_cache: dict[str, tuple[datetime, object]] = {}
+_REMOTE_CACHE_TTL = timedelta(minutes=10)
+
+
+def _cached_fetch(key, fetch):
+    """fetch() の結果を一定時間キャッシュする。失敗時は古いキャッシュがあればそれを返す。"""
+    cached = _remote_cache.get(key)
+    now = datetime.now(JST)
+    if cached and now - cached[0] < _REMOTE_CACHE_TTL:
+        return cached[1]
+    try:
+        value = fetch()
+    except (requests.RequestException, ValueError) as e:
+        logger.warning("%s の取得に失敗しました: %s", key, e)
+        return cached[1] if cached else None
+    _remote_cache[key] = (now, value)
+    return value
+
+
+def _fetch_menu_page_links():
+    resp = requests.get(MENU_PAGE_URL, timeout=10)
+    resp.raise_for_status()
+    resp.encoding = "utf-8"
+    return parse_menu_page_links(resp.text)
+
+
+def find_pdf_url_on_page(year, month):
+    """掲載ページのリンクから指定月の PDF URL を返す（無ければ None）"""
+    links = _cached_fetch("掲載ページ", _fetch_menu_page_links) or {}
+    return links.get((year, month))
+
+
+def _fetch_post_pdf_attachments():
+    """REST API で掲載記事に添付された PDF を [(アップロード日, url), ...] で返す"""
+    resp = requests.get(
+        f"{WP_API_BASE}/media",
+        params={
+            "parent": MENU_POST_ID,
+            "mime_type": "application/pdf",
+            "per_page": 30,
+            "orderby": "date",
+            "order": "desc",
+            "_fields": "date,source_url",
+        },
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return [
+        (datetime.fromisoformat(item["date"]).date(), requests.utils.requote_uri(item["source_url"]))
+        for item in resp.json()
+    ]
+
+
+def find_pdf_urls_in_attachments(year, month):
+    """掲載記事の添付 PDF のうち、指定月の献立の可能性があるものを新しい順に返す。
+    ファイル名から月は判別できないため、アップロード日で絞り込み、中身の確認は呼び出し側に任せる。"""
+    from datetime import date
+    attachments = _cached_fetch("添付 PDF 一覧", _fetch_post_pdf_attachments) or []
+    first_day = date(year, month, 1)
+    last_day = date(year, month, calendar.monthrange(year, month)[1])
+    # 献立は前月末〜当月初旬に上がることが多い。改訂版は月中にも上がる
+    window_start = first_day - timedelta(days=62)
+    return [url for uploaded, url in attachments if window_start <= uploaded <= last_day]
+
+
+def iter_pdf_url_candidates(year, month):
+    """指定月の献立 PDF URL の候補を信頼度の高い順に重複なしで返す。
+    1. 掲載ページのリンク  2. 掲載記事の添付 PDF  3. ファイル名の推測
+    ジェネレータなので、前の候補で見つかれば後ろの取得処理は走らない。"""
+    from datetime import date
+
+    def sources():
+        url = find_pdf_url_on_page(year, month)
+        if url:
+            yield url
+        yield from find_pdf_urls_in_attachments(year, month)
+        first_day = date(year, month, 1)
+        # HEAD が使えないサーバーへの対応として、見つからなければ全候補を GET で試す
+        yield from _find_existing_pdf_urls(first_day) or build_pdf_url_candidates(first_day)
+
+    seen = set()
+    for url in sources():
+        if url not in seen:
+            seen.add(url)
+            yield url
 
 
 def download_pdf(url):
@@ -437,16 +571,14 @@ def _get_menus_from_url(url, year, month):
 
 def get_menus_for_month(year, month):
     """指定月の全メニューを ({date: menu_dict}, url) で返す"""
-    from datetime import date
-    first_day = date(year, month, 1)
-
-    # HEAD が使えないサーバーへの対応として、見つからなければ全候補を GET で試す
-    urls = _find_existing_pdf_urls(first_day) or build_pdf_url_candidates(first_day)
-
-    for url in urls:
+    for url in iter_pdf_url_candidates(year, month):
         try:
             menus = _get_menus_from_url(url, year, month)
         except requests.HTTPError:
+            continue
+        except Exception as e:
+            # 添付 PDF には献立以外（給食だより等）も混ざるため、壊れた PDF は飛ばす
+            logger.warning("PDF の解析に失敗したためスキップ: %s (%s)", url, e)
             continue
         if menus:
             return menus, url
@@ -694,7 +826,7 @@ async def cmd_menu(interaction: discord.Interaction, date_str: str = None):
         embed = format_menu_embed(target, menu, url)
         await interaction.followup.send(embed=embed)
     except requests.HTTPError:
-        await interaction.followup.send(f"⚠️ 献立 PDF が見つかりません。\nURL: {build_pdf_url(target)}")
+        await interaction.followup.send(f"⚠️ 献立 PDF が見つかりません。\n掲載ページ: {MENU_PAGE_URL}")
     except Exception as e:
         logger.exception("/menu コマンドでエラー")
         await interaction.followup.send(f"⚠️ エラーが発生しました: {e}")
@@ -709,7 +841,7 @@ async def cmd_tomorrow(interaction: discord.Interaction):
         embed = format_menu_embed(tomorrow, menu, url)
         await interaction.followup.send(embed=embed)
     except requests.HTTPError:
-        await interaction.followup.send(f"⚠️ 献立 PDF が見つかりません。\nURL: {build_pdf_url(tomorrow)}")
+        await interaction.followup.send(f"⚠️ 献立 PDF が見つかりません。\n掲載ページ: {MENU_PAGE_URL}")
     except Exception as e:
         logger.exception("/tomorrow コマンドでエラー")
         await interaction.followup.send(f"⚠️ エラーが発生しました: {e}")
@@ -735,6 +867,14 @@ async def cmd_search(
         # 月全体の PDF 解析は時間がかかるため別スレッドで実行
         menus, url = await asyncio.to_thread(get_menus_for_month, year, month)
         hits = search_menus(menus, keyword)
+        # ヒットが 1 日分だけならその日の献立全体を表示する
+        hit_dates = {d for d, _, _ in hits}
+        if len(hit_dates) == 1:
+            d = hit_dates.pop()
+            embed = format_menu_embed(d, menus[d], url)
+            embed.set_footer(text=f"🔍 「{keyword}」の検索結果: この日のみヒット")
+            await interaction.followup.send(embed=embed)
+            return
         # 1 メッセージの Embed 合計は 6000 文字までなので 1 件ずつ送る
         for embed in format_search_embeds(keyword, year, month, hits, url):
             await interaction.followup.send(embed=embed)
@@ -757,11 +897,17 @@ async def cmd_debug(interaction: discord.Interaction, date_str: str = None):
         target = datetime.now(JST).date()
 
     await interaction.response.defer()
-    url = build_pdf_url(target)
+    try:
+        _, url = await asyncio.to_thread(get_menus_for_month, target.year, target.month)
+    except requests.HTTPError:
+        # 解析できる PDF が無い場合も生データを見られるよう、最有力候補を表示する
+        url = await asyncio.to_thread(
+            lambda: find_pdf_url_on_page(target.year, target.month) or build_pdf_url(target)
+        )
     msgs = [f"📄 PDF URL: {url}"]
 
     try:
-        pdf_bytes = download_pdf(url)
+        pdf_bytes = await asyncio.to_thread(download_pdf, url)
     except requests.HTTPError as e:
         await interaction.followup.send(f"⚠️ PDF の取得に失敗: {e}")
         return
